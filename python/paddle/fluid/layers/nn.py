@@ -1544,7 +1544,8 @@ def conv2d(input,
     filter_shape = [num_filters, int(num_filter_channels)] + filter_size
 
     def _get_default_param_initializer():
-        std = (2.0 / (filter_size[0]**2 * num_channels))**0.5
+        filter_elem_num = filter_size[0] * filter_size[1] * num_channels
+        std = (2.0 / filter_elem_num)**0.5
         return Normal(0.0, std, 0)
 
     filter_param = helper.create_parameter(
@@ -1704,7 +1705,8 @@ def conv3d(input,
     filter_shape = [num_filters, num_filter_channels] + filter_size
 
     def _get_default_param_initializer():
-        std = (2.0 / (filter_size[0]**3 * num_channels))**0.5
+        filter_elem_num = filter_size[0] * filter_size[1] * num_channels
+        std = (2.0 / filter_elem_num)**0.5
         return Normal(0.0, std, 0)
 
     filter_param = helper.create_parameter(
