@@ -27,6 +27,7 @@ set(COMMON_KERNEL_DEPS ${COMMON_KERNEL_DEPS} eigen_function blas)
 # remove this dep after removing fluid deps on tensor creation
 set(COMMON_KERNEL_DEPS ${COMMON_KERNEL_DEPS} pten_api_utils)
 set(COMMON_KERNEL_DEPS ${COMMON_KERNEL_DEPS} infermeta)
+set(COMMON_KERNEL_DEPS ${COMMON_KERNEL_DEPS} math_function)
 
 set(MATH_KERNEL_DEPS ${COMMON_KERNEL_DEPS} cast_kernel copy_kernel pten_transpose_cpu)
 if(WITH_GPU OR WITH_ROCM)
