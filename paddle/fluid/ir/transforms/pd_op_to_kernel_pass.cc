@@ -14,7 +14,7 @@
 
 #include <iostream>
 
-#include "paddle/fluid/ir/pass/pd_op_to_kernel_pass.h"
+#include "paddle/fluid/ir/transforms/pd_op_to_kernel_pass.h"
 
 #include "paddle/fluid/ir/dialect/kernel_attribute.h"
 #include "paddle/fluid/ir/dialect/kernel_dialect.h"
@@ -171,6 +171,10 @@ phi::KernelKey GetKernelKey(
     if (kernel_data_type == phi::DataType::UNDEFINED) {
       kernel_data_type = kernel_key.dtype();
     }
+  }
+
+  if (kernel_backend == phi::Backend::UNDEFINED) {
+    kernel_backend = paddle::experimental::ParseBackend(place);
   }
 
   phi::KernelKey res(kernel_backend, kernel_layout, kernel_data_type);
