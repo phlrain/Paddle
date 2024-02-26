@@ -590,7 +590,7 @@ std::vector<OpPatternKind> GetOpPatternVector(
 
 static const int NOT_FOUND = -1;
 
-std::set<Expr*> CollectLoadExprPointer(
+std::set<Expr*> CollectLoadStoreExprPointer(
     Expr x, std::function<bool(const Expr*)>&& teller) {
   if (!x.defined()) return std::set<Expr*>();
   struct Mutator : public ir::IRMutator<> {
@@ -602,6 +602,11 @@ std::set<Expr*> CollectLoadExprPointer(
     void operator()(Expr* expr) { ir::IRMutator<Expr*>::Visit(expr, expr); }
 
     void Visit(const ir::Load* op, Expr* expr) override {
+      if (teller(expr)) {
+        exprs.insert(expr);
+      }
+    }
+    void Visit(const ir::Store* op, Expr* expr) override {
       if (teller(expr)) {
         exprs.insert(expr);
       }
@@ -645,48 +650,35 @@ class TrivalOp {
         output_tensor(output_tensor) {}
 
   TrivalOp(const TrivalOp& other) {
-    VLOG(3) << "step2";
     output_iter_vars = other.output_iter_vars;
-    VLOG(3) << "step2";
-    input_vars = other.input_vars;
-    VLOG(3) << "step2";
+    input_tensors.clear();
     for (const auto& input_tensor : other.input_tensors) {
       input_tensors.push_back(input_tensor);
     }
-    VLOG(3) << "step2";
+    input_tensors = other.input_tensors;
     index_exprs = other.index_exprs;
-    VLOG(3) << "step2";
     name_counter = other.name_counter;
-    VLOG(3) << "step2";
     core_func = other.core_func;
-    VLOG(3) << "step2";
     output_tensor = other.output_tensor;
-    VLOG(3) << "step2";
   }
 
   TrivalOp& operator=(const TrivalOp& other) {
-    VLOG(3) << "step1";
+    if (this == &other) return *this;
     output_iter_vars = other.output_iter_vars;
-    VLOG(3) << "step1";
+    input_tensors.clear();
     for (const auto& input_tensor : other.input_tensors) {
       input_tensors.push_back(input_tensor);
     }
-    VLOG(3) << "step1";
     input_tensors = other.input_tensors;
-    VLOG(3) << "step1";
     index_exprs = other.index_exprs;
-    VLOG(3) << "step1";
     name_counter = other.name_counter;
-    VLOG(3) << "step1";
     core_func = other.core_func;
-    VLOG(3) << "step1";
     output_tensor = other.output_tensor;
-    VLOG(3) << "step1";
+    return *this;
   }
 
   explicit TrivalOp(const ir::Expr& origin_func_body) {
     auto func_body = ir::ir_utils::IRCopy(origin_func_body);
-
     std::set<Expr> store_tensor_exprs =
         cinn::ir::ir_utils::CollectIRNodesWithoutTensor(
             func_body, [](const Expr* expr) {
@@ -712,7 +704,7 @@ class TrivalOp {
     const auto& store_value =
         (*store_tensor_exprs.begin()).As<ir::Store>()->value;
     std::set<Expr*> load_tensor_exprs =
-        CollectLoadExprPointer(store_value, [](const Expr* expr) {
+        CollectLoadStoreExprPointer(store_value, [](const Expr* expr) {
           return expr->As<ir::Load>() && expr->As<ir::Load>()->is_addr_tensor();
         });
     for (const auto& load_expr : load_tensor_exprs) {
@@ -757,7 +749,29 @@ class TrivalOp {
             << "\n    " << core_func;
   }
 
-  ir::Expr to_expr() { PADDLE_THROW("TrivalOp to_expr not implemented"); }
+  ir::Expr to_expr(ir::Expr original) {
+    // we reuse the original for loop and replace the body.
+    VLOG(4) << "Before to_expr: " << original;
+    auto cloned_compute = ir::ir_utils::IRCopy(original);
+    std::set<Expr*> stores =
+        CollectLoadStoreExprPointer(cloned_compute, [](const Expr* expr) {
+          return expr->As<ir::Store>() &&
+                 expr->As<ir::Store>()->is_addr_tensor();
+        });
+    ir::Expr* store_expr = *stores.begin();
+    ir::Expr value_expr = [&]() {
+      std::vector<ir::Expr> load_with_index_exprs;
+      for (size_t i = 0; i < input_tensors.size(); ++i) {
+        load_with_index_exprs.push_back(input_tensors[i](index_exprs[i]));
+      }
+      return CopyedReplaceExpr(core_func, input_vars, load_with_index_exprs);
+    }();
+    (*store_expr) = ir::Store::Make(store_expr->As<ir::Store>()->tensor,
+                                    value_expr,
+                                    store_expr->As<ir::Store>()->indices);
+    VLOG(4) << "After to_expr: " << cloned_compute;
+    return cloned_compute;
+  }
 
   static std::vector<ir::Expr> ComposeIndexExpr(
       const std::vector<ir::Expr>& upstream_index_exprs,
@@ -812,23 +826,16 @@ class TrivalOp {
                                           int connect_idx) {
     VLOG(4) << "ComposeSingleConnectIdx " << connect_idx;
     std::vector<ir::Var> output_iter_vars = downstream.output_iter_vars;
-    VLOG(4) << "step1";
     std::vector<ir::Var> input_vars = downstream.input_vars;
-    VLOG(4) << "step1";
     std::vector<ir::Tensor> input_tensors = downstream.input_tensors;
-    VLOG(4) << "step1";
     std::vector<std::vector<ir::Expr>> index_exprs = downstream.index_exprs;
-    VLOG(4) << "step1";
     int name_counter = downstream.name_counter;
 
     // update input_vars, input_tensors, index_exprs
     // Step 1: remove connect_idx
     input_vars.erase(input_vars.begin() + connect_idx);
-    VLOG(4) << "step1";
     input_tensors.erase(input_tensors.begin() + connect_idx);
-    VLOG(4) << "step1";
     index_exprs.erase(index_exprs.begin() + connect_idx);
-    VLOG(4) << "step1";
 
     // Step2: Inline the upstream input_vars, input_tensors, index_exprs
     size_t inline_start_idx = input_vars.size();
@@ -842,8 +849,6 @@ class TrivalOp {
                            upstream.output_iter_vars));
     }
 
-    VLOG(4) << "step2";
-
     // update core_func
     ir::Expr core_func = ComposeCoreExpr(
         downstream.core_func,
@@ -854,8 +859,6 @@ class TrivalOp {
         std::vector<ir::Var>(upstream.input_vars.begin(),
                              upstream.input_vars.end()),
         std::vector<ir::Var>(input_vars.begin(), input_vars.end()));
-
-    VLOG(4) << "step3";
 
     // update output_tensor
     ir::Tensor output_tensor = downstream.output_tensor;
@@ -869,7 +872,6 @@ class TrivalOp {
                         core_func);
     VLOG(4) << "ComposeSingleConnectIdx done.";
     ret.DebugPrint();
-    VLOG(4) << "start return.";
     return ret;
   }
 
@@ -989,10 +991,10 @@ std::pair<int, int> SearchForAdjacentInjectives(
 ir::Expr TrivalFusion(ir::Expr upper, ir::Expr down) {
   TrivalOp upper_op(upper);
   TrivalOp down_op(down);
-  VLOG(4) << "before TrivalOp::Compuse";
+  VLOG(4) << "before TrivalOp::Compute";
   auto fused = TrivalOp::Compose(upper_op, down_op);
   VLOG(4) << "before to_expr";
-  return fused.to_expr();
+  return fused.to_expr(down);
 }
 
 std::vector<ir::Expr> OpInlineFusion(const GroupPtr& group,
@@ -1013,6 +1015,7 @@ std::vector<ir::Expr> OpInlineFusion(const GroupPtr& group,
         SearchForAdjacentInjectives(op_patterns, funcs);
     int upper_stream = idx_pair.first, down_stream = idx_pair.second;
     if (upper_stream == NOT_FOUND) {
+      VLOG(4) << "Not found Injective + Injective, break.";
       break;
     }
     VLOG(4) << "Find Injective + Injective" << upper_stream << " "
@@ -1029,6 +1032,7 @@ std::vector<ir::Expr> OpInlineFusion(const GroupPtr& group,
     };
     update_funcs_and_op_patterns();
   }
+  return funcs;
 }
 
 std::vector<ir::LoweredFunc> OpLowererImpl::LowerGroup(
