@@ -1,4 +1,4 @@
-// Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
+// Copyright (c) 2024 PaddlePaddle Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,14 @@
 
 #pragma once
 
-#include "paddle/pir/pass/pass.h"
+#include "paddle/pir/include/pass/pass.h"
 
 namespace cinn {
 namespace dialect {
 namespace ir {
+
+// Split One GroupOp to multi small GroupOp
+// Each small GroupOp can Generate one kernel by CINN backend
 
 IR_API std::unique_ptr<pir::Pass> CreateCinnGroupClusterPass();
 

@@ -23,15 +23,15 @@
 #include "paddle/cinn/hlir/dialect/operator/ir/op_dialect.h"
 #include "paddle/cinn/hlir/framework/op.h"
 #include "paddle/cinn/hlir/framework/pir/op_mapper.h"
+#include "paddle/common/flags.h"
 #include "paddle/fluid/pir/dialect/operator/ir/op_attribute.h"
 #include "paddle/fluid/pir/dialect/operator/ir/pd_op.h"
 #include "paddle/phi/common/data_type.h"
-#include "paddle/pir/core/builtin_op.h"
-#include "paddle/pir/core/builtin_type.h"
-#include "paddle/pir/dialect/control_flow/ir/cf_dialect.h"
-#include "paddle/pir/dialect/control_flow/ir/cf_op.h"
-#include "paddle/pir/dialect/shape/ir/shape_attribute.h"
-#include "paddle/utils/flags.h"
+#include "paddle/pir/include/core/builtin_op.h"
+#include "paddle/pir/include/core/builtin_type.h"
+#include "paddle/pir/include/dialect/control_flow/ir/cf_dialect.h"
+#include "paddle/pir/include/dialect/control_flow/ir/cf_op.h"
+#include "paddle/pir/include/dialect/shape/ir/shape_attribute.h"
 
 PD_DECLARE_string(allow_cinn_ops);
 PD_DECLARE_string(deny_cinn_ops);
@@ -46,7 +46,6 @@ namespace pir {
 // list, we judge them by search it in CINN global Operator table.
 const std::unordered_map<std::string, std::string> CompatibleInfo::OP_NAMES = {
     {"pd_op.full", "fill_constant"},
-    {"pd_op.sum", "reduce_sum"},
     {"pd_op.max", "reduce_max"},
     {"pd_op.add", "elementwise_add"},
     {"pd_op.elementwise_pow", "pow"},
@@ -57,7 +56,7 @@ const std::unordered_map<std::string, std::string> CompatibleInfo::OP_NAMES = {
     {"pd_op.squeeze", "reshape"},
     {"pd_op.unsqueeze", "reshape"},
     {"pd_op.split_with_num", "split"},
-    {"pd_op.expand", "broadcast_to"},
+    // {"pd_op.expand", "broadcast_to"},
     {"cinn_op.generate_shape", "generate_shape"},
     {"cinn_op.broadcast", "broadcast_to"}};
 
@@ -148,6 +147,21 @@ bool HaveZeroDimInput(const ::pir::Operation& op) {
     auto tensor_type = type.dyn_cast<::pir::DenseTensorType>();
     return tensor_type && tensor_type.dims().size() == 0U;
   };
+
+  auto HasNegDim = [](const ::pir::Type& type) {
+    auto tensor_type = type.dyn_cast<::pir::DenseTensorType>();
+
+    if (tensor_type) {
+      for (size_t i = 0; i < tensor_type.dims().size(); ++i) {
+        if (tensor_type.dims()[i] < 0) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  };
+
   // Judge for vector<Type>
   auto HasZeroDimInVT = [&](const std::vector<::pir::Type>& types) {
     for (auto& type : types) {
@@ -161,7 +175,7 @@ bool HaveZeroDimInput(const ::pir::Operation& op) {
     if (!value || !value.type()) continue;
     if (auto vector_type = value.type().dyn_cast<::pir::VectorType>()) {
       if (HasZeroDimInVT(vector_type.data())) return true;
-    } else if (HasZeroDim(value.type())) {
+    } else if (HasZeroDim(value.type()) || HasNegDim(value.type())) {
       return true;
     }
   }
@@ -203,7 +217,8 @@ bool IsRegisteredInCINN(const ::pir::Operation& op) {
 }
 
 bool IsSupportForCinn(const ::pir::Operation& op) {
-  if (!AllInputDenseTensor(op) || UnimplementOps(op)) {
+  if (!AllInputDenseTensor(op) || HaveZeroDimInput(op) || UnimplementOps(op)) {
+    // if (!AllInputDenseTensor(op) || UnimplementOps(op)) {
     VLOG(4) << "Found " << op.name()
             << " HaveZeroDimInput or UnimplementOps or NotAllInputDenseTensor. "
             << "So mark IsSupportForCinn: " << false;
@@ -211,8 +226,8 @@ bool IsSupportForCinn(const ::pir::Operation& op) {
   }
   auto allow_ops = StringSplit(FLAGS_allow_cinn_ops, kDelim);
   auto deny_ops = StringSplit(FLAGS_deny_cinn_ops, kDelim);
-  VLOG(4) << "The allowed Cinn Ops: " << GetDebugInfo(allow_ops);
-  VLOG(4) << "The denied Cinn Ops: " << GetDebugInfo(deny_ops);
+  LOG_FIRST_N(INFO, 1) << "The allowed Cinn Ops: " << GetDebugInfo(allow_ops);
+  LOG_FIRST_N(INFO, 1) << "The denied Cinn Ops: " << GetDebugInfo(deny_ops);
   // Strip the dialect, like pd_op.abs -> abs
   const auto op_name = CompatibleInfo::OpName(op);
 
@@ -260,7 +275,7 @@ std::string CompatibleInfo::OpName(const ::pir::Operation& op) {
     return name;
   }
   auto cinn_op_name = name.substr(pos + 1);
-  VLOG(4) << "GetOpName: " << name << " -> " << cinn_op_name;
+  VLOG(7) << "GetOpName: " << name << " -> " << cinn_op_name;
   CHECK(cinn_op_name != "")
       << "Found empty cinn_op_name, maybe you should implement OpPattern for "
       << name;
@@ -293,7 +308,7 @@ std::string CompatibleInfo::ValueName(const ::pir::Value& value) {
 std::vector<::pir::Value> CompatibleInfo::RealOperandSources(
     const ::pir::Operation& op) {
   if (OpMapper::Instance().has(op, MapperType::OPERAND)) {
-    return OpMapper::Instance().RealOprandSources(op);
+    return OpMapper::Instance().RealOperandSources(op);
   } else {
     return op.operands_source();
   }
@@ -417,7 +432,7 @@ int CompatibleInfo::ShapeProduct(const std::vector<int>& shape) {
 OpPatternKind CompatibleInfo::OpKind(const ::pir::Operation& op) {
   auto& op_pattern_dict = Operator::GetAttrs<OpPatternKind>("OpPattern");
   auto op_name = CompatibleInfo::OpName(op);
-  if (op_name == "generate_shape") {
+  if (op_name == "generate_shape" || op_name == "store") {
     return hlir::framework::kNonFusible;
   }
   const hlir::framework::Operator* cinn_op = Operator::Get(op_name);
@@ -425,7 +440,7 @@ OpPatternKind CompatibleInfo::OpKind(const ::pir::Operation& op) {
   auto kind = op_pattern_dict[cinn_op];
   if (kind == hlir::framework::kBroadcast) {
     // As binary op was defined as broadcast, actually it should be
-    // element-wise. See fusion_hepler_base.h for detail.
+    // element-wise. See fusion_helper_base.h for detail.
     if (op_name != "broadcast_to") {
       kind = hlir::framework::kElementWise;
     }

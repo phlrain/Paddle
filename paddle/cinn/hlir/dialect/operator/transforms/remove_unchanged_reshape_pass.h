@@ -14,22 +14,14 @@
 
 #pragma once
 
-#include "paddle/pir/pass/pass.h"
-#include "paddle/pir/pattern_rewrite/frozen_rewrite_pattern_set.h"
+#include "paddle/pir/include/pass/pass.h"
+#include "paddle/pir/include/pattern_rewrite/frozen_rewrite_pattern_set.h"
 
 namespace cinn {
 namespace dialect {
 namespace ir {
 
-class RemoveUnchangedReshapePass : public pir::PatternRewritePass {
- public:
-  RemoveUnchangedReshapePass();
-
-  pir::RewritePatternSet InitializePatterns(pir::IrContext *context) override;
-
-  bool CanApplyOn(pir::Operation *op) const override;
-};
-
+std::unique_ptr<pir::Pass> CreateRemoveUnchangedReshapePass();
 }  // namespace ir
 }  // namespace dialect
 }  // namespace cinn

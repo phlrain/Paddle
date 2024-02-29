@@ -27,11 +27,11 @@
 #include "paddle/cinn/ir/schedule/ir_schedule.h"
 #include "paddle/cinn/ir/schedule/ir_schedule_util.h"
 #include "paddle/cinn/lang/packed_func.h"
-#include "paddle/pir/core/operation.h"
+#include "paddle/pir/include/core/operation.h"
 
 // Fusion Op lowering, there are four kinds of lowering function:
 // Elementwise/Broadcast/Injective,Reduce,OutEWiseFusable,NonFusible.
-// Elementwise/Broadcast/Injective Ops is with same shcedule.
+// Elementwise/Broadcast/Injective Ops is with same schedule.
 // Reduce,OutEWiseFusable,NonFusible are using different schedule.
 
 namespace cinn {
@@ -270,6 +270,8 @@ class OpLowererImpl : public OpLowererImplBase<GroupPtr> {
 
   common::Type GetTensorDtype(const ::pir::Value& value);
 
+  void BuildBroadcastInfo(const GroupPtr& group);
+
   Target target_;
 
   PrettyNamer* name_gene_;
@@ -283,8 +285,6 @@ class OpLowererImpl : public OpLowererImplBase<GroupPtr> {
   std::unordered_map<std::string, cinn::ir::BroadcastInfo> broadcast_info;
   std::unordered_map<std::string, cinn::ir::BroadcastInfo>
       broadcast_to_elementwise;
-
-  std::set<std::string> copyed_var_names;
 
   std::unordered_set<::pir::Operation*> erase_reshape;
 

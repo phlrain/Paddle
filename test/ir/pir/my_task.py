@@ -55,6 +55,50 @@ class Parser:
 
     def run(self, file):
         program = self.load_from(file)
+        for op in program.global_block().ops:
+            if op.name() == "pd_op.reshape":
+                if (
+                    op.result(1).initialized()
+                    and not op.result(1).use_empty()
+                    and op.result(1).first_use().owner().name() == "pd_op.fetch"
+                ):
+                    program.global_block().remove_op(
+                        op.result(1).first_use().owner()
+                    )
+
+            if op.name() == "pd_op.squeeze":
+                if (
+                    op.result(1).initialized()
+                    and not op.result(1).use_empty()
+                    and op.result(1).first_use().owner().name() == "pd_op.fetch"
+                ):
+                    program.global_block().remove_op(
+                        op.result(1).first_use().owner()
+                    )
+
+            if op.name() == "pd_op.unsqueeze":
+                if (
+                    op.result(1).initialized()
+                    and not op.result(1).use_empty()
+                    and op.result(1).first_use().owner().name() == "pd_op.fetch"
+                ):
+                    program.global_block().remove_op(
+                        op.result(1).first_use().owner()
+                    )
+
+            if (
+                op.name() == "pd_op.batch_norm_"
+                or op.name() == "pd_op.batch_norm"
+            ):
+                if (
+                    op.result(5).initialized()
+                    and not op.result(5).use_empty()
+                    and op.result(5).first_use().owner().name() == "pd_op.fetch"
+                ):
+                    program.global_block().remove_op(
+                        op.result(5).first_use().owner()
+                    )
+
         feeds = self.parse_feeds(program)
         fetchs = self.parse_fetchs(program)
 
@@ -120,18 +164,14 @@ class TestTask(unittest.TestCase):
             program_info.program, feed, fetch_list, False
         )
 
-        print(len(cinn_out))
-        print(len(base_out))
-
         for cinn_res, base_res, fetch_name in zip(
             cinn_out, base_out, fetch_list
         ):
-            # if fetch_name.find( "pt_intermediate") != -1:
-            #     continue
-            print(cinn_res, base_res)
             print(fetch_name)
-            # print( np.allclose( cinn_res, base_res ) )
+            # print( cinn_res )
+            # print( base_res )
             np.testing.assert_allclose(cinn_res, base_res, atol=1e-4, rtol=1e-4)
+            print("fin")
 
     def check_infer(self, enable_cinn):
         parser = Parser()
@@ -143,19 +183,11 @@ class TestTask(unittest.TestCase):
             return self.run_program(
                 program_info.program, feed, fetch_list, enable_cinn
             )
-        else:
-            print("Have dy shape just skip here")
 
     def run_program(self, program, feed, fetch_list, enable_cinn):
-        print("enable_cinn", enable_cinn)
         if enable_cinn:
-            print(program)
             paddle.decomposition.decomp.decompose(program, [])
-            print(program)
-            fwd_pm = paddle.base.libpaddle.pir.PassManager()
-            paddle.base.libpaddle.pir.add_cinn_pass(fwd_pm, program)
-            fwd_pm.run(program)
-            print("after cinn", program)
+            paddle.base.libpaddle.pir.apply_cinn_pass(program)
 
         exe = paddle.static.Executor(paddle.CUDAPlace(0))
         outs = exe._run_pir_impl(

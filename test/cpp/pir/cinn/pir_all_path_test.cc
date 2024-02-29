@@ -20,9 +20,10 @@
 #include "paddle/cinn/hlir/dialect/operator/ir/manual_op.h"
 #include "paddle/cinn/hlir/dialect/operator/ir/op_dialect.h"
 #include "paddle/cinn/hlir/dialect/operator/transforms/add_broadcast_to_elementwise_pass.h"
+#include "paddle/cinn/hlir/dialect/operator/transforms/add_store_in_fusion_op_pass.h"
 #include "paddle/cinn/hlir/dialect/operator/transforms/cinn_group_cluster_pass.h"
 #include "paddle/cinn/hlir/dialect/operator/transforms/group_merge/divide_group_op_to_fusion_op_pass.h"
-#include "paddle/cinn/hlir/dialect/operator/transforms/group_merge/lower_cinn_fusion_op_pass.h"
+#include "paddle/cinn/hlir/dialect/operator/transforms/lower_cinn_fusion_op_pass.h"
 #include "paddle/cinn/hlir/dialect/operator/transforms/merge_reshape_with_broadcast_pass.h"
 #include "paddle/cinn/hlir/dialect/operator/transforms/pd_to_cinn_pass.h"
 #include "paddle/fluid/framework/new_executor/interpretercore.h"
@@ -32,14 +33,14 @@
 #include "paddle/fluid/pir/transforms/build_cinn_pass.h"
 #include "paddle/fluid/pir/transforms/dead_code_elimination_pass.h"
 #include "paddle/fluid/pir/transforms/pd_op_to_kernel_pass.h"
-#include "paddle/pir/core/builtin_dialect.h"
-#include "paddle/pir/core/builtin_type.h"
-#include "paddle/pir/core/ir_context.h"
-#include "paddle/pir/core/program.h"
-#include "paddle/pir/dialect/control_flow/ir/cf_dialect.h"
-#include "paddle/pir/dialect/control_flow/ir/cf_op.h"
-#include "paddle/pir/pass/pass.h"
-#include "paddle/pir/pass/pass_manager.h"
+#include "paddle/pir/include/core/builtin_dialect.h"
+#include "paddle/pir/include/core/builtin_type.h"
+#include "paddle/pir/include/core/ir_context.h"
+#include "paddle/pir/include/core/program.h"
+#include "paddle/pir/include/dialect/control_flow/ir/cf_dialect.h"
+#include "paddle/pir/include/dialect/control_flow/ir/cf_op.h"
+#include "paddle/pir/include/pass/pass.h"
+#include "paddle/pir/include/pass/pass_manager.h"
 
 bool simple_cmp(float a, float b) { return std::abs((a - b) / a) < 1e-5; }
 
@@ -63,19 +64,18 @@ static void RunAndCheckResult(::pir::Program* program,
 
   pir::PassManager pm(ctx);
   pm.AddPass(cinn::dialect::ir::CreatePdOpToCinnOpPass());
-  pm.AddPass(
-      std::make_unique<cinn::dialect::ir::AddBroadcastToElementwisePass>());
+  pm.AddPass(cinn::dialect::ir::CreateAddBroadcastToElementwisePass());
   pm.AddPass(
       std::make_unique<cinn::dialect::ir::MergeReshapeWithBroadcastPass>());
+
   pm.AddPass(pir::CreateDeadCodeEliminationPass());
   pm.AddPass(pir::CreateBuildCinnPass());
   pm.AddPass(cinn::dialect::ir::CreateCinnGroupClusterPass());
+  pm.AddPass(cinn::dialect::ir::CreateAddStoreInFusionOpPass());
+  pm.AddPass(pir::CreateDeadCodeEliminationPass());
   pm.AddPass(cinn::dialect::ir::CreateLowerCinnFusionOpPass());
   pm.EnableIRPrinting();
-
   CHECK_EQ(pm.Run(program), true);
-
-  program->Print(std::cout);
 
   paddle::platform::Place place = paddle::platform::CUDAPlace(0);
 
@@ -91,7 +91,6 @@ static void RunAndCheckResult(::pir::Program* program,
   auto out_tensor =
       executor.local_scope()->FindVar("out@fetch")->Get<phi::DenseTensor>();
 
-  // std::cerr << out_tensor << std::endl;
   if (check_result) {
     bool res0 = simple_cmp(out_tensor.data<float>()[0], gt_val);
     EXPECT_EQ(res0, true);
@@ -707,345 +706,33 @@ static void RunAndCheckResult(::pir::Program* program,
 //   RunAndCheckResult(program.get(), 2.0);
 // }
 
-// std::shared_ptr<::pir::Program> BuildAddSumProgram() {
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-
-//   auto program = std::make_shared<::pir::Program>(ctx);
-//   ::pir::Builder builder = ::pir::Builder(ctx, program->block());
-
-//   // full -> softmax(max -> subtract -> exp -> sum -> divide)
-//   const float value_one = 1.0;
-//   const std::vector<int64_t> shape = {256, 128, 256};
-//   auto x = builder
-//                .Build<paddle::dialect::UniformOp>(
-//                    shape, phi::DataType::FLOAT32, -0.5, 0.5, 0,
-//                    phi::GPUPlace())
-//                .result(0);
-
-//   auto y = builder
-//                .Build<paddle::dialect::UniformOp>(
-//                    shape, phi::DataType::FLOAT32, -0.5, 0.5, 0,
-//                    phi::GPUPlace())
-//                .result(0);
-
-//   auto add = builder.Build<paddle::dialect::AddOp>(x, y).result(0);
-//   auto sum =
-//       builder
-//           .Build<paddle::dialect::SumOp>(
-//               add, std::vector<int64_t>{-1}, phi::DataType::FLOAT32, true)
-//           .result(0);
-
-//   builder.Build<paddle::dialect::FetchOp>(sum, "out", 0);
-//   return program;
-// }
-
-// TEST(GroupOp, TestAddSum) {
-//   // Step 1: Construct pir::Program
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   std::shared_ptr<::pir::Program> program = BuildAddSumProgram();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-//   ctx->GetOrRegisterDialect<cinn::dialect::OperatorDialect>();
-
-//   RunAndCheckResult(program.get(), false);
-// }
-
-// std::shared_ptr<::pir::Program> BuildSharedBufferProgram() {
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-
-//   auto program = std::make_shared<::pir::Program>(ctx);
-//   ::pir::Builder builder = ::pir::Builder(ctx, program->block());
-
-//   // full -> softmax(max -> subtract -> exp -> sum -> divide)
-//   const float value_one = 1.0;
-//   const std::vector<int64_t> shape = {256, 512};
-//   auto x =
-//       builder
-//           .Build<paddle::dialect::UniformOp>(std::vector<int64_t>({256,
-//           512}),
-//                                              phi::DataType::FLOAT32,
-//                                              -0.5,
-//                                              0.5,
-//                                              0,
-//                                              phi::GPUPlace())
-//           .result(0);
-
-//   auto y = builder
-//                .Build<paddle::dialect::UniformOp>(
-//                    shape, phi::DataType::FLOAT32, -0.5, 0.5, 0,
-//                    phi::GPUPlace())
-//                .result(0);
-//   auto sum = builder
-//                  .Build<paddle::dialect::SumOp>(
-//                      x, std::vector<int64_t>{-1}, phi::DataType::FLOAT32,
-//                      true)
-//                  .result(0);
-//   auto t1 = builder.Build<paddle::dialect::ScaleOp>(sum, 1.0,
-//   1e-5).result(0);
-
-//   auto add = builder.Build<paddle::dialect::AddOp>(t1, y).result(0);
-
-//   builder.Build<paddle::dialect::FetchOp>(add, "out", 0);
-//   return program;
-// }
-
-// TEST(GroupOp, TestSharedBufferProgram) {
-//   // Step 1: Construct pir::Program
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   std::shared_ptr<::pir::Program> program = BuildSharedBufferProgram();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-//   ctx->GetOrRegisterDialect<cinn::dialect::OperatorDialect>();
-
-//   RunAndCheckResult(program.get(), false);
-// }
-
-// std::shared_ptr<::pir::Program> BuildSharedBuffer1Program() {
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-
-//   auto program = std::make_shared<::pir::Program>(ctx);
-//   ::pir::Builder builder = ::pir::Builder(ctx, program->block());
-
-//   // full -> softmax(max -> subtract -> exp -> sum -> divide)
-//   const float value_one = 1.0;
-//   const std::vector<int64_t> shape = {256, 512};
-//   auto x =
-//       builder
-//           .Build<paddle::dialect::UniformOp>(std::vector<int64_t>({256,
-//           512}),
-//                                              phi::DataType::FLOAT32,
-//                                              -0.5,
-//                                              0.5,
-//                                              0,
-//                                              phi::GPUPlace())
-//           .result(0);
-
-//   auto y = builder
-//                .Build<paddle::dialect::UniformOp>(
-//                    shape, phi::DataType::FLOAT32, -0.5, 0.5, 0,
-//                    phi::GPUPlace())
-//                .result(0);
-//   // auto scale = builder
-//   // .Build<paddle::dialect::UniformOp>(std::vector<int64_t>({768}),
-//   //                                                1.0,
-//   // phi::DataType::FLOAT32,
-//   //                                                phi::GPUPlace())
-//   //                .result(0);
-//   auto num = builder
-//                  .Build<paddle::dialect::FullOp>(std::vector<int64_t>{256,
-//                  1},
-//                                                  512.0,
-//                                                  phi::DataType::FLOAT32,
-//                                                  phi::CPUPlace())
-//                  .result(0);
-
-//   auto eps = builder
-//                  .Build<paddle::dialect::FullOp>(std::vector<int64_t>{256,
-//                  1},
-//                                                  0.05,
-//                                                  phi::DataType::FLOAT32,
-//                                                  phi::CPUPlace())
-//                  .result(0);
-//   auto sum = builder
-//                  .Build<paddle::dialect::SumOp>(
-//                      x, std::vector<int64_t>{-1}, phi::DataType::FLOAT32,
-//                      true)
-//                  .result(0);
-
-//   auto mean = builder.Build<paddle::dialect::DivideOp>(sum, num).result(0);
-//   auto add = builder.Build<paddle::dialect::DivideOp>(mean, eps).result(0);
-
-//   auto t1 = builder.Build<paddle::dialect::SqrtOp>(add).result(0);
-
-//   auto add1 = builder.Build<paddle::dialect::AddOp>(t1, y).result(0);
-
-//   builder.Build<paddle::dialect::FetchOp>(add1, "out", 0);
-//   builder.Build<paddle::dialect::FetchOp>(num, "num", 1);
-//   builder.Build<paddle::dialect::FetchOp>(t1, "t1", 2);
-//   return program;
-// }
-
-// TEST(GroupOp, TestSharedBuffer1Program) {
-//   // Step 1: Construct pir::Program
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   std::shared_ptr<::pir::Program> program = BuildSharedBuffer1Program();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-//   ctx->GetOrRegisterDialect<cinn::dialect::OperatorDialect>();
-
-//   program->Print(std::cout);
-//   RunAndCheckResult(program.get(), false);
-// }
-
-// std::shared_ptr<::pir::Program> BuildSharedBuffer1Program() {
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-
-//   auto program = std::make_shared<::pir::Program>(ctx);
-//   ::pir::Builder builder = ::pir::Builder(ctx, program->block());
-
-//   // full -> softmax(max -> subtract -> exp -> sum -> divide)
-//   const float value_one = 1.0;
-//   const std::vector<int64_t> shape = {3, 4, 5};
-//   auto x = builder
-//                .Build<paddle::dialect::UniformOp>(
-//                   shape,
-//                    phi::DataType::FLOAT32,
-//                    -0.5,
-//                    0.5,
-//                    0,
-//                    phi::GPUPlace())
-//                .result(0);
-
-//   auto out = builder
-//                  .Build<paddle::dialect::ReshapeOp>(
-//                      x, std::vector<int64_t>({12, 5}))
-//                  .result(0);
-
-//   builder.Build<paddle::dialect::FetchOp>(out, "out", 0);
-
-//   return program;
-// }
-
-// TEST(GroupOp, TestSharedBuffer1Program) {
-//   // Step 1: Construct pir::Program
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   std::shared_ptr<::pir::Program> program = BuildSharedBuffer1Program();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-//   ctx->GetOrRegisterDialect<cinn::dialect::OperatorDialect>();
-
-//   program->Print(std::cout);
-//   RunAndCheckResult(program.get(), false);
-// }
-
-// std::shared_ptr<::pir::Program> BuildBroadcast2DimProgram() {
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-
-//   auto program = std::make_shared<::pir::Program>(ctx);
-//   ::pir::Builder builder = ::pir::Builder(ctx, program->block());
-
-//   // full -> softmax(max -> subtract -> exp -> sum -> divide)
-//   const float value_one = 1.0;
-//   const std::vector<int64_t> shape = {3, 4, 5};
-//   auto x = builder
-//                .Build<paddle::dialect::FullOp>(std::vector<int64_t>{8, 8, 1,
-//                1},
-//                                                0.05,
-//                                                phi::DataType::FLOAT32,
-//                                                phi::CPUPlace())
-//                .result(0);
-//   auto y = builder
-//                .Build<paddle::dialect::FullOp>(std::vector<int64_t>{8, 8, 8,
-//                8},
-//                                                0.05,
-//                                                phi::DataType::FLOAT32,
-//                                                phi::CPUPlace())
-//                .result(0);
-//   auto t = builder.Build<paddle::dialect::ReluOp>(x).result(0);
-//   auto out = builder.Build<paddle::dialect::AddOp>(t, y).result(0);
-
-//   builder.Build<paddle::dialect::FetchOp>(out, "out", 0);
-
-//   return program;
-// }
-
-// TEST(GroupOp, TestProgram) {
-//   // Step 1: Construct pir::Program
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   std::shared_ptr<::pir::Program> program = BuildBroadcast2DimProgram();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-//   ctx->GetOrRegisterDialect<cinn::dialect::OperatorDialect>();
-
-//   program->Print(std::cout);
-//   RunAndCheckResult(program.get(), false);
-// }
-
-// std::shared_ptr<::pir::Program> BuildBroadcastTwiceProgram() {
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-
-//   auto program = std::make_shared<::pir::Program>(ctx);
-//   ::pir::Builder builder = ::pir::Builder(ctx, program->block());
-
-//   // full -> softmax(max -> subtract -> exp -> sum -> divide)
-//   const float value_one = 1.0;
-//   const std::vector<int64_t> shape = {3, 4, 5};
-//   auto x = builder
-//                .Build<paddle::dialect::FullOp>(std::vector<int64_t>{1},
-//                                                0.05,
-//                                                phi::DataType::FLOAT32,
-//                                                phi::CPUPlace())
-//                .result(0);
-//   auto y = builder
-//                .Build<paddle::dialect::FullOp>(std::vector<int64_t>{ 8, 1},
-//                                                0.05,
-//                                                phi::DataType::FLOAT32,
-//                                                phi::CPUPlace())
-//                .result(0);
-//   auto z = builder
-//                .Build<paddle::dialect::FullOp>(std::vector<int64_t>{ 8, 8},
-//                                                0.05,
-//                                                phi::DataType::FLOAT32,
-//                                                phi::CPUPlace())
-//                .result(0);
-//   auto t1 =builder.Build<paddle::dialect::SinOp>(x).result(0);
-//   auto t = builder.Build<paddle::dialect::AddOp>(t1, y).result(0);
-//   // auto t2 =  builder.Build<paddle::dialect::ReshapeOp>( t,
-//   std::vector<int64_t>{8, 8, 1}).result(0); auto out =
-//   builder.Build<paddle::dialect::AddOp>(t, z).result(0);
-
-//   builder.Build<paddle::dialect::FetchOp>(out, "out", 0);
-
-//   return program;
-// }
-
-// TEST(GroupOp, TestBroadcastTwice) {
-//   // Step 1: Construct pir::Program
-//   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-//   std::shared_ptr<::pir::Program> program = BuildBroadcastTwiceProgram();
-//   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-//   ctx->GetOrRegisterDialect<cinn::dialect::OperatorDialect>();
-
-//   program->Print(std::cout);
-//   RunAndCheckResult(program.get(), false);
-// }
-
-std::shared_ptr<::pir::Program> BuildRedcuceProgram() {
+std::shared_ptr<::pir::Program> BuildSmallSumGroupProgram() {
   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
   ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-
   auto program = std::make_shared<::pir::Program>(ctx);
   ::pir::Builder builder = ::pir::Builder(ctx, program->block());
 
-  // full -> softmax(max -> subtract -> exp -> sum -> divide)
-  const float value_one = 1.0;
-  const std::vector<int64_t> shape = {3, 4, 5};
-  auto x =
+  auto x = builder
+               .Build<paddle::dialect::FullOp>(std::vector<int64_t>({8, 4}),
+                                               1.0,
+                                               phi::DataType::FLOAT32,
+                                               phi::GPUPlace())
+               .result(0);
+
+  auto out =
       builder
-          .Build<paddle::dialect::FullOp>(std::vector<int64_t>{1, 2048, 1, 128},
-                                          0.05,
-                                          phi::DataType::FLOAT32,
-                                          phi::CPUPlace())
+          .Build<paddle::dialect::SumOp>(
+              x, std::vector<int64_t>({}), paddle::DataType::FLOAT32, true)
           .result(0);
 
-  auto out = builder
-                 .Build<paddle::dialect::SumOp>(
-                     x, std::vector<int64_t>({2}), phi::DataType::FLOAT32)
-                 .result(0);
-
   builder.Build<paddle::dialect::FetchOp>(out, "out", 0);
-
   return program;
 }
 
-TEST(GroupOp, TestReduc) {
+TEST(GroupOp, TestBuildSum2Group) {
   // Step 1: Construct pir::Program
   ::pir::IrContext* ctx = ::pir::IrContext::Instance();
-  std::shared_ptr<::pir::Program> program = BuildRedcuceProgram();
-  ctx->GetOrRegisterDialect<paddle::dialect::OperatorDialect>();
-  ctx->GetOrRegisterDialect<cinn::dialect::OperatorDialect>();
+  std::shared_ptr<::pir::Program> program = BuildSmallSumGroupProgram();
 
-  program->Print(std::cout);
-  RunAndCheckResult(program.get(), false);
+  RunAndCheckResult(program.get(), true, 32.0);
 }

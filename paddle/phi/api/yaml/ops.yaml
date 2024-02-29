@@ -364,6 +364,7 @@
     func : bitwise_and
     backend : x
   inplace: (x -> out)
+  interfaces : paddle::dialect::InferSymbolicShapeInterface
 
 - op : bitwise_left_shift
   args : (Tensor x, Tensor y, bool is_arithmetic = true)
@@ -921,6 +922,7 @@
     data_type : x
   optional : y
   backward : expand_as_grad
+  interfaces : paddle::dialect::InferSymbolicShapeInterface
 
 - op : expm1
   args : (Tensor x)
@@ -1618,6 +1620,7 @@
     func : log
   inplace: (x -> out)
   backward: log_grad
+  interfaces : paddle::dialect::InferSymbolicShapeInterface
 
 - op : log10
   args : (Tensor x)
@@ -1687,17 +1690,19 @@
     data_type : x
     backend : x
   inplace: (x -> out)
+  interfaces : paddle::dialect::InferSymbolicShapeInterface
 
 - op : logical_not
   args : (Tensor x)
   output : Tensor(out)
   infer_meta :
-    func : LogicalNotInfermeta
+    func : LogicalNotInferMeta
   kernel :
     func : logical_not
     data_type : x
     backend : x
   inplace: (x -> out)
+  interfaces : paddle::dialect::InferSymbolicShapeInterface
 
 - op : logical_or
   args : (Tensor x, Tensor y)
@@ -2267,13 +2272,15 @@
 
 - op : rms_norm
   args : (Tensor x, Tensor bias, Tensor residual, Tensor norm_weight, Tensor norm_bias, float epsilon, int begin_norm_axis, float quant_scale, int quant_round_type, float quant_max_bound, float quant_min_bound)
-  output : Tensor(out), Tensor(residual_out)
+  output : Tensor(out), Tensor(residual_out), Tensor(inv_var)
   infer_meta :
     func : RmsNormInferMeta
   kernel :
     func : rms_norm
     data_type : x
   optional : bias, residual, norm_bias, residual_out
+  intermediate : inv_var
+  backward : rms_norm_grad
 
 - op : rmsprop_
   args : (Tensor param, Tensor mean_square, Tensor grad, Tensor moment, Tensor learning_rate, Tensor mean_grad, Tensor master_param, float epsilon = 1.0e-10f, float decay = 0.9f, float momentum = 0.0f, bool centered = false, bool multi_precision = false)
@@ -2693,6 +2700,16 @@
     func : svd
   backward : svd_grad
 
+- op : swiglu
+  args : (Tensor x, Tensor y)
+  output : Tensor(out)
+  infer_meta:
+     func: SwiGLUInferMeta
+  kernel:
+     func : swiglu
+  optional : y
+  backward: swiglu_grad
+
 - op : take_along_axis
   args : (Tensor arr, Tensor indices, int axis)
   output : Tensor
@@ -2774,6 +2791,7 @@
     func : top_p_sampling
     data_type : x
   optional : threshold
+  interfaces : paddle::dialect::InferSymbolicShapeInterface
 
 - op : topk
   args : (Tensor x, Scalar(int) k = 1, int axis = -1, bool largest = true, bool sorted = true)
