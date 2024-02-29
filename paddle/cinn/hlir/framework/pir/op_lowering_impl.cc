@@ -651,11 +651,8 @@ class TrivalOp {
 
   TrivalOp(const TrivalOp& other) {
     output_iter_vars = other.output_iter_vars;
-    input_tensors.clear();
-    for (const auto& input_tensor : other.input_tensors) {
-      input_tensors.push_back(input_tensor);
-    }
     input_tensors = other.input_tensors;
+    input_vars = other.input_vars;
     index_exprs = other.index_exprs;
     name_counter = other.name_counter;
     core_func = other.core_func;
@@ -665,11 +662,8 @@ class TrivalOp {
   TrivalOp& operator=(const TrivalOp& other) {
     if (this == &other) return *this;
     output_iter_vars = other.output_iter_vars;
-    input_tensors.clear();
-    for (const auto& input_tensor : other.input_tensors) {
-      input_tensors.push_back(input_tensor);
-    }
     input_tensors = other.input_tensors;
+    input_vars = other.input_vars;
     index_exprs = other.index_exprs;
     name_counter = other.name_counter;
     core_func = other.core_func;
@@ -801,6 +795,8 @@ class TrivalOp {
       const std::vector<ir::Var>& downstream_input_new_name) {
     // fmap CopyedReplaceExpr [expr]
     const auto index_replaced_upstream_core_expr = [&]() -> ir::Expr {
+      VLOG(4) << "ComposeCoreExpr 1: " << upstream_iter_vars.size() << " "
+              << down_stream_index_expr.size();
       return CopyedReplaceExpr(
           upstream_core_expr, upstream_iter_vars, down_stream_index_expr);
     }();
@@ -811,11 +807,14 @@ class TrivalOp {
                      downstream_input_new_name.end(),
                      std::back_inserter(downstream_new_name_expr),
                      [&](const ir::Var& var) { return Expr(var); });
+      VLOG(4) << "ComposeCoreExpr 2: " << upstream_input_var_name.size() << " "
+              << downstream_new_name_expr.size();
       return CopyedReplaceExpr(index_replaced_upstream_core_expr,
                                upstream_input_var_name,
                                downstream_new_name_expr);
     }();
 
+    VLOG(4) << "ComposeCoreExpr 3: ";
     return CopyedReplaceExpr(downstream_core_expr,
                              {downstream_input_var},
                              {var_replaced_upstream_core_expr});
@@ -824,7 +823,6 @@ class TrivalOp {
   static TrivalOp ComposeSingleConnectIdx(const TrivalOp& upstream,
                                           const TrivalOp& downstream,
                                           int connect_idx) {
-    VLOG(4) << "ComposeSingleConnectIdx " << connect_idx;
     std::vector<ir::Var> output_iter_vars = downstream.output_iter_vars;
     std::vector<ir::Var> input_vars = downstream.input_vars;
     std::vector<ir::Tensor> input_tensors = downstream.input_tensors;
@@ -833,6 +831,15 @@ class TrivalOp {
 
     // update input_vars, input_tensors, index_exprs
     // Step 1: remove connect_idx
+    VLOG(4) << "ComposeSingleConnectIdx: input_tensors.size() "
+            << input_tensors.size();
+    VLOG(4) << "ComposeSingleConnectIdx: input_vars.size() "
+            << input_vars.size();
+    VLOG(4) << "ComposeSingleConnectIdx: downstream.input_vars "
+            << downstream.input_vars.size();
+    VLOG(4) << "ComposeSingleConnectIdx: index_exprs.size() "
+            << index_exprs.size();
+
     input_vars.erase(input_vars.begin() + connect_idx);
     input_tensors.erase(input_tensors.begin() + connect_idx);
     index_exprs.erase(index_exprs.begin() + connect_idx);
@@ -858,7 +865,8 @@ class TrivalOp {
         upstream.output_iter_vars,
         std::vector<ir::Var>(upstream.input_vars.begin(),
                              upstream.input_vars.end()),
-        std::vector<ir::Var>(input_vars.begin(), input_vars.end()));
+        std::vector<ir::Var>(input_vars.end() - upstream.input_vars.size(),
+                             input_vars.end()));
 
     // update output_tensor
     ir::Tensor output_tensor = downstream.output_tensor;
@@ -968,7 +976,7 @@ static bool IsAdjecent(const ir::Expr& upstream, const ir::Expr& downstream) {
   return false;
 }
 
-std::pair<int, int> SearchForAdjacentInjectives(
+std::pair<int, int> SearchAdjacentInjectives(
     const std::vector<OpPatternKind>& op_patterns,
     const std::vector<ir::Expr>& funcs) {
   int upper_stream = NOT_FOUND;
@@ -1006,13 +1014,14 @@ std::vector<ir::Expr> OpInlineFusion(const GroupPtr& group,
 
   auto op_patterns = GetOpPatternVector(ops);
 
+  VLOG(4) << "op_patterns.size() = " << op_patterns.size();
+  VLOG(4) << "      funcs.size() = " << funcs.size();
   PADDLE_ENFORCE_EQ(
       op_patterns.size(), funcs.size(), "ops and funcs size not equal");
 
   while (true) {
     VLOG(4) << "Start search for Injective + Injective";
-    std::pair<int, int> idx_pair =
-        SearchForAdjacentInjectives(op_patterns, funcs);
+    std::pair<int, int> idx_pair = SearchAdjacentInjectives(op_patterns, funcs);
     int upper_stream = idx_pair.first, down_stream = idx_pair.second;
     if (upper_stream == NOT_FOUND) {
       VLOG(4) << "Not found Injective + Injective, break.";
