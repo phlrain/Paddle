@@ -472,6 +472,482 @@ std::vector<ir::LoweredFunc> OpLowererImpl::LowerMapExpr(
                      &group_func_args);
 }
 
+std::vector<OpPatternKind> GetOpPatternVector(
+    const std::vector<::pir::Operation*> ops) {
+  auto& op_pattern_map =
+      Operator::GetAttrs<cinn::hlir::framework::OpPatternKind>("OpPattern");
+  std::vector<OpPatternKind> op_patterns;
+  std::transform(ops.begin(),
+                 ops.end(),
+                 std::back_inserter(op_patterns),
+                 [&op_pattern_map](const ::pir::Operation* op) {
+                   std::string cinn_op_name = CompatibleInfo::OpName(*op);
+                   const hlir::framework::Operator* cinn_op =
+                       Operator::Get(cinn_op_name);
+                   return op_pattern_map[cinn_op];
+                 });
+  for (auto op_ptn : op_patterns) {
+    VLOG(4) << "OpPattern is :" << op_ptn;
+  }
+  return op_patterns;
+}
+
+static const int NOT_FOUND = -1;
+
+std::set<Expr*> CollectLoadStoreExprPointer(
+    Expr x, std::function<bool(const Expr*)>&& teller) {
+  if (!x.defined()) return std::set<Expr*>();
+  struct Mutator : public ir::IRMutator<> {
+    std::function<bool(const Expr*)> teller;
+    std::set<Expr*> exprs;
+    explicit Mutator(std::function<bool(const Expr*)>&& teller)
+        : teller(std::move(teller)) {}
+
+    void operator()(Expr* expr) { ir::IRMutator<Expr*>::Visit(expr, expr); }
+
+    void Visit(const ir::Load* op, Expr* expr) override {
+      if (teller(expr)) {
+        exprs.insert(expr);
+      }
+    }
+    void Visit(const ir::Store* op, Expr* expr) override {
+      if (teller(expr)) {
+        exprs.insert(expr);
+      }
+    }
+  };
+
+  Mutator mutator(std::move(teller));
+  mutator(&x);
+  return mutator.exprs;
+}
+
+class TrivalOp {
+ public:
+  // Diff here! Don't flatten the output tensor, so we have a list of iter_vars.
+  std::vector<ir::Var> output_iter_vars;
+
+  // GetInputIndex
+  std::vector<ir::Var> input_vars;
+  std::vector<ir::Tensor> input_tensors;
+  std::vector<std::vector<ir::Expr>> index_exprs;
+  ir::Tensor output_tensor;
+
+  int name_counter = 0;
+
+  // CoreFunction
+  ir::Expr core_func;
+
+  TrivalOp(std::vector<ir::Var> output_iter_vars,
+           std::vector<ir::Var> input_vars,
+           std::vector<ir::Tensor> input_tensors,
+           std::vector<std::vector<ir::Expr>> index_exprs,
+           ir::Tensor output_tensor,
+           int name_counter,
+           ir::Expr core_func)
+      : output_iter_vars(output_iter_vars),
+        input_vars(input_vars),
+        index_exprs(index_exprs),
+        name_counter(name_counter),
+        core_func(core_func),
+        input_tensors(input_tensors),
+        output_tensor(output_tensor) {}
+
+  TrivalOp(const TrivalOp& other) {
+    output_iter_vars = other.output_iter_vars;
+    input_tensors = other.input_tensors;
+    input_vars = other.input_vars;
+    index_exprs = other.index_exprs;
+    name_counter = other.name_counter;
+    core_func = other.core_func;
+    output_tensor = other.output_tensor;
+  }
+
+  TrivalOp& operator=(const TrivalOp& other) {
+    if (this == &other) return *this;
+    output_iter_vars = other.output_iter_vars;
+    input_tensors = other.input_tensors;
+    input_vars = other.input_vars;
+    index_exprs = other.index_exprs;
+    name_counter = other.name_counter;
+    core_func = other.core_func;
+    output_tensor = other.output_tensor;
+    return *this;
+  }
+
+  explicit TrivalOp(const ir::Expr& origin_func_body) {
+    auto func_body = ir::ir_utils::IRCopy(origin_func_body);
+    std::set<Expr> store_tensor_exprs =
+        cinn::ir::ir_utils::CollectIRNodesWithoutTensor(
+            func_body, [](const Expr* expr) {
+              return expr->As<ir::Store>() &&
+                     expr->As<ir::Store>()->is_addr_tensor();
+            });
+
+    output_tensor =
+        (*store_tensor_exprs.begin()).As<ir::Store>()->tensor.as_tensor_ref();
+
+    // initialize for output_iter_vars
+    PADDLE_ENFORCE(store_tensor_exprs.size() == 1,
+                   "TrivalOp must store for output only once.");
+    auto store_iter_vars =
+        (*store_tensor_exprs.begin()).As<ir::Store>()->indices;
+    for (const auto& var : store_iter_vars) {
+      PADDLE_ENFORCE(var.is_var(), "store_iter_vars should be ir::Var");
+    }
+    output_iter_vars.insert(
+        output_iter_vars.end(), store_iter_vars.begin(), store_iter_vars.end());
+
+    // initialize for input_var and index_expr
+    const auto& store_value =
+        (*store_tensor_exprs.begin()).As<ir::Store>()->value;
+    std::set<Expr*> load_tensor_exprs =
+        CollectLoadStoreExprPointer(store_value, [](const Expr* expr) {
+          return expr->As<ir::Load>() && expr->As<ir::Load>()->is_addr_tensor();
+        });
+    for (const auto& load_expr : load_tensor_exprs) {
+      auto load = load_expr->As<ir::Load>();
+      input_tensors.push_back(load->tensor.as_tensor_ref());
+      input_vars.emplace_back(CreateVarName(name_counter++));
+      index_exprs.push_back(load->indices);
+
+      // replace load_expr with input_var
+      // transform A[f(i,j,k)] -> Var('A')
+      *load_expr = input_vars.back();
+    }
+
+    // initialize for core_func, we have change all the load_expr to input_var
+    core_func = store_value;
+
+    DebugPrint();
+  }
+
+  void DebugPrint() const {
+    VLOG(4) << "output_iter_vars: ";
+    for (const auto& var : output_iter_vars) {
+      VLOG(4) << "    " << var;
+    }
+    VLOG(4) << "input_vars: ";
+    for (const auto& var : input_vars) {
+      VLOG(4) << "    " << var;
+    }
+    VLOG(4) << "input_tensors: ";
+    for (const auto& tensor : input_tensors) {
+      VLOG(4) << "    " << tensor;
+    }
+    VLOG(4) << "output_tensors: ";
+    VLOG(4) << "    " << output_tensor;
+    VLOG(4) << "index_exprs: ";
+    for (const auto& index_expr : index_exprs) {
+      for (const auto& expr : index_expr) {
+        VLOG(4) << "    " << expr;
+      }
+    }
+    VLOG(4) << "core_func: "
+            << "\n    " << core_func;
+  }
+
+  ir::Expr to_expr(ir::Expr original) {
+    // we reuse the original for loop and replace the body.
+    VLOG(4) << "Before to_expr: " << original;
+    auto cloned_compute = ir::ir_utils::IRCopy(original);
+    std::set<Expr*> stores =
+        CollectLoadStoreExprPointer(cloned_compute, [](const Expr* expr) {
+          return expr->As<ir::Store>() &&
+                 expr->As<ir::Store>()->is_addr_tensor();
+        });
+    ir::Expr* store_expr = *stores.begin();
+    ir::Expr value_expr = [&]() {
+      std::vector<ir::Expr> load_with_index_exprs;
+      for (size_t i = 0; i < input_tensors.size(); ++i) {
+        load_with_index_exprs.push_back(input_tensors[i](index_exprs[i]));
+      }
+      return CopyedReplaceExpr(core_func, input_vars, load_with_index_exprs);
+    }();
+    (*store_expr) = ir::Store::Make(store_expr->As<ir::Store>()->tensor,
+                                    value_expr,
+                                    store_expr->As<ir::Store>()->indices);
+    VLOG(4) << "After to_expr: " << cloned_compute;
+    return cloned_compute;
+  }
+
+  static std::vector<ir::Expr> ComposeIndexExpr(
+      const std::vector<ir::Expr>& upstream_index_exprs,
+      const std::vector<ir::Expr>& down_stream_index_expr,
+      const std::vector<ir::Var>& upstream_iter_vars) {
+    // fmap CopyedReplaceExpr [expr]
+    VLOG(4) << "ComposeIndexExpr Start.";
+    std::vector<ir::Expr> result;
+    std::transform(upstream_index_exprs.begin(),
+                   upstream_index_exprs.end(),
+                   std::back_inserter(result),
+                   [&](const ir::Expr& expr) {
+                     return CopyedReplaceExpr(
+                         expr, upstream_iter_vars, down_stream_index_expr);
+                   });
+    VLOG(4) << "ComposeIndexExpr End";
+    return result;
+  }
+
+  static ir::Expr ComposeCoreExpr(
+      const ir::Expr& downstream_core_expr,
+      const ir::Var& downstream_input_var,
+      const ir::Expr& upstream_core_expr,
+      const std::vector<ir::Expr>& down_stream_index_expr,
+      const std::vector<ir::Var>& upstream_iter_vars,
+      const std::vector<ir::Var>& upstream_input_var_name,
+      const std::vector<ir::Var>& downstream_input_new_name) {
+    // fmap CopyedReplaceExpr [expr]
+    const auto index_replaced_upstream_core_expr = [&]() -> ir::Expr {
+      VLOG(4) << "ComposeCoreExpr 1: " << upstream_iter_vars.size() << " "
+              << down_stream_index_expr.size();
+      return CopyedReplaceExpr(
+          upstream_core_expr, upstream_iter_vars, down_stream_index_expr);
+    }();
+
+    const auto var_replaced_upstream_core_expr = [&]() -> ir::Expr {
+      std::vector<ir::Expr> downstream_new_name_expr;
+      std::transform(downstream_input_new_name.begin(),
+                     downstream_input_new_name.end(),
+                     std::back_inserter(downstream_new_name_expr),
+                     [&](const ir::Var& var) { return Expr(var); });
+      VLOG(4) << "ComposeCoreExpr 2: " << upstream_input_var_name.size() << " "
+              << downstream_new_name_expr.size();
+      return CopyedReplaceExpr(index_replaced_upstream_core_expr,
+                               upstream_input_var_name,
+                               downstream_new_name_expr);
+    }();
+
+    VLOG(4) << "ComposeCoreExpr 3: ";
+    return CopyedReplaceExpr(downstream_core_expr,
+                             {downstream_input_var},
+                             {var_replaced_upstream_core_expr});
+  }
+
+  static TrivalOp ComposeSingleConnectIdx(const TrivalOp& upstream,
+                                          const TrivalOp& downstream,
+                                          int connect_idx) {
+    std::vector<ir::Var> output_iter_vars = downstream.output_iter_vars;
+    std::vector<ir::Var> input_vars = downstream.input_vars;
+    std::vector<ir::Tensor> input_tensors = downstream.input_tensors;
+    std::vector<std::vector<ir::Expr>> index_exprs = downstream.index_exprs;
+    int name_counter = downstream.name_counter;
+
+    // update input_vars, input_tensors, index_exprs
+    // Step 1: remove connect_idx
+    VLOG(4) << "ComposeSingleConnectIdx: input_tensors.size() "
+            << input_tensors.size();
+    VLOG(4) << "ComposeSingleConnectIdx: input_vars.size() "
+            << input_vars.size();
+    VLOG(4) << "ComposeSingleConnectIdx: downstream.input_vars "
+            << downstream.input_vars.size();
+    VLOG(4) << "ComposeSingleConnectIdx: index_exprs.size() "
+            << index_exprs.size();
+
+    input_vars.erase(input_vars.begin() + connect_idx);
+    input_tensors.erase(input_tensors.begin() + connect_idx);
+    index_exprs.erase(index_exprs.begin() + connect_idx);
+
+    // Step2: Inline the upstream input_vars, input_tensors, index_exprs
+    size_t inline_start_idx = input_vars.size();
+    for (int i = 0; i < upstream.input_vars.size(); ++i) {
+      input_vars.push_back(CreateVarName(name_counter++));
+      input_tensors.push_back(upstream.input_tensors[i]);
+      // index_exprs need compose
+      index_exprs.push_back(
+          ComposeIndexExpr(upstream.index_exprs[i],
+                           downstream.index_exprs[connect_idx],
+                           upstream.output_iter_vars));
+    }
+
+    // update core_func
+    ir::Expr core_func = ComposeCoreExpr(
+        downstream.core_func,
+        downstream.input_vars[connect_idx],
+        upstream.core_func,
+        downstream.index_exprs[connect_idx],
+        upstream.output_iter_vars,
+        std::vector<ir::Var>(upstream.input_vars.begin(),
+                             upstream.input_vars.end()),
+        std::vector<ir::Var>(input_vars.end() - upstream.input_vars.size(),
+                             input_vars.end()));
+
+    // update output_tensor
+    ir::Tensor output_tensor = downstream.output_tensor;
+
+    auto ret = TrivalOp(output_iter_vars,
+                        input_vars,
+                        input_tensors,
+                        index_exprs,
+                        output_tensor,
+                        name_counter,
+                        core_func);
+    VLOG(4) << "ComposeSingleConnectIdx done.";
+    ret.DebugPrint();
+    return ret;
+  }
+
+  static TrivalOp Compose(const TrivalOp& upstream,
+                          const TrivalOp& downstream) {
+    // Get connect_idx.
+    std::vector<int> connect_ids;
+    PADDLE_ENFORCE_EQ(
+        downstream.input_tensors.size(),
+        downstream.input_vars.size(),
+        "size of input_tensors and input_vars should be the same.");
+    VLOG(4) << "==============";
+    upstream.DebugPrint();
+    VLOG(4) << "==============";
+    downstream.DebugPrint();
+    VLOG(4) << "==============";
+    for (int i = static_cast<int>(downstream.input_tensors.size()); i >= 1;
+         --i) {
+      VLOG(4) << "i = : " << i - 1;
+      if (downstream.input_tensors[i - 1]->name ==
+          upstream.output_tensor->name) {
+        VLOG(4) << "connect ids: " << i - 1;
+        connect_ids.push_back(static_cast<int>(i - 1));
+        VLOG(4) << "after connect ids: " << i - 1;
+      }
+    }
+    VLOG(4) << "before assign ";
+    TrivalOp iter_op(downstream);
+    VLOG(4) << "end assign ";
+    for (int i : connect_ids) {
+      VLOG(4) << "Start ComposeSingleConnectIdx with connect_idx: " << i;
+      iter_op = ComposeSingleConnectIdx(upstream, iter_op, static_cast<int>(i));
+      VLOG(4) << "Done ComposeSingleConnectIdx with connect_idx: " << i;
+    }
+    VLOG(4) << "After OpFusion: ";
+    iter_op.DebugPrint();
+    return iter_op;
+  }
+
+ private:
+  static ir::Var CreateVarName(int counter) {
+    return ir::Var("var" + std::to_string(counter++), type_of<float>());
+  }
+  static Expr CopyedReplaceExpr(const Expr& source,
+                                const std::vector<Var>& replaced,
+                                const std::vector<Expr>& candidates) {
+    CHECK_EQ(replaced.size(), candidates.size())
+        << "In ReplaceExpr, the size of Vars to be replaced must be equal to "
+           "the "
+           "size of cadidate Exprs! Please check.";
+    auto copyed_source = ir::ir_utils::IRCopy(source);
+    if (replaced.empty()) return copyed_source;
+    std::map<Var, Expr, ir::CompVar> replacing_map;
+    for (int i = 0; i < replaced.size(); ++i) {
+      // If the Var to be replaced is equal to the candidate, we skip it.
+      if (candidates[i].is_var() && candidates[i].as_var_ref() == replaced[i])
+        continue;
+      replacing_map[replaced[i]] = candidates[i];
+    }
+    ir::MappingVarToExprMutator mapper(replacing_map);
+    mapper(&copyed_source);
+    return copyed_source;
+  }
+};
+
+static bool IsAdjecent(const ir::Expr& upstream, const ir::Expr& downstream) {
+  // 1. Get inputs / output from Expr, then we can tell whether they are
+  // adjecent.
+  std::set<Expr> upstream_stores =
+      cinn::ir::ir_utils::CollectIRNodesWithoutTensor(
+          upstream, [](const Expr* expr) {
+            return expr->As<ir::Store>() &&
+                   expr->As<ir::Store>()->is_addr_tensor();
+          });
+  // don't support multi-output yet.
+  PADDLE_ENFORCE(upstream_stores.size() == 1,
+                 "The expr of injective should have only one store");
+
+  std::set<Expr> downstream_loads =
+      cinn::ir::ir_utils::CollectIRNodesWithoutTensor(
+          downstream, [](const Expr* expr) {
+            return expr->As<ir::Load>() &&
+                   expr->As<ir::Load>()->is_addr_tensor();
+          });
+
+  for (const auto& upstream_store : upstream_stores) {
+    for (const auto& downstream_load : downstream_loads) {
+      if (upstream_store.As<ir::Store>()->tensor.As<ir::_Tensor_>()->name ==
+          downstream_load.As<ir::Load>()->tensor.As<ir::_Tensor_>()->name) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::pair<int, int> SearchAdjacentInjectives(
+    const std::vector<OpPatternKind>& op_patterns,
+    const std::vector<ir::Expr>& funcs) {
+  int upper_stream = NOT_FOUND;
+  int down_stream = NOT_FOUND;
+  for (int i = 0; i < op_patterns.size(); i++) {
+    if (op_patterns[i] <= OpPatternKind::kInjective) {
+      for (int j = i + 1; j < op_patterns.size(); j++) {
+        if (op_patterns[j] <= OpPatternKind::kInjective &&
+            IsAdjecent(funcs[i], funcs[j])) {
+          upper_stream = i;
+          down_stream = j;
+          return std::make_pair(upper_stream, down_stream);
+        }
+      }
+    }
+  }
+  return std::make_pair(upper_stream, down_stream);
+}
+
+ir::Expr TrivalFusion(ir::Expr upper, ir::Expr down) {
+  TrivalOp upper_op(upper);
+  TrivalOp down_op(down);
+  VLOG(4) << "before TrivalOp::Compute";
+  auto fused = TrivalOp::Compose(upper_op, down_op);
+  VLOG(4) << "before to_expr";
+  return fused.to_expr(down);
+}
+
+std::vector<ir::Expr> OpInlineFusion(const GroupPtr& group,
+                                     const std::vector<::pir::Operation*> ops,
+                                     std::vector<ir::Expr> funcs) {
+  for (const auto& func : funcs) {
+    VLOG(4) << "OpInlineFusion: {FuncBody is} :" << func;
+  }
+
+  auto op_patterns = GetOpPatternVector(ops);
+
+  VLOG(4) << "op_patterns.size() = " << op_patterns.size();
+  VLOG(4) << "      funcs.size() = " << funcs.size();
+  PADDLE_ENFORCE_EQ(
+      op_patterns.size(), funcs.size(), "ops and funcs size not equal");
+
+  while (true) {
+    VLOG(4) << "Start search for Injective + Injective";
+    std::pair<int, int> idx_pair = SearchAdjacentInjectives(op_patterns, funcs);
+    int upper_stream = idx_pair.first, down_stream = idx_pair.second;
+    if (upper_stream == NOT_FOUND) {
+      VLOG(4) << "Not found Injective + Injective, break.";
+      break;
+    }
+    VLOG(4) << "Find Injective + Injective" << upper_stream << " "
+            << down_stream;
+    ir::Expr func_body = TrivalFusion(funcs[upper_stream], funcs[down_stream]);
+
+    // update
+    auto update_funcs_and_op_patterns = [&]() {
+      funcs[down_stream] = func_body;
+      op_patterns[down_stream] = OpPatternKind::kInjective;
+
+      funcs.erase(funcs.begin() + upper_stream);
+      op_patterns.erase(op_patterns.begin() + upper_stream);
+    };
+    update_funcs_and_op_patterns();
+  }
+  return funcs;
+}
+
 std::vector<ir::LoweredFunc> OpLowererImpl::LowerGroup(
     const GroupPtr& group,
     bool apply_op_schedule,
@@ -504,6 +980,8 @@ std::vector<ir::LoweredFunc> OpLowererImpl::LowerGroup(
                &group_func_arg_tensors,
                &tensor_map,
                &tmp_tensor_info);
+
+  func_bodies = OpInlineFusion(group, ops, func_bodies);
 
   std::unordered_set<::pir::Value> inner_genevalue;
   std::unordered_set<::pir::Operation*> ops_set(ops.begin(), ops.end());
